@@ -227,6 +227,10 @@ class lm_agent:
         return (getattr(self.LLM, "peer_consult_protocol", None) ==
                 "PeerConsultV4")
 
+    def _uses_common_v4_policy(self):
+        return (self._uses_v4_protocol() and
+                getattr(self, "peer_consult_policy", "legacy") == "llm")
+
     def _uses_shared_delivery_target_adapter(self):
         """Return whether a verified shared task target may feed executor IO.
 
@@ -447,7 +451,7 @@ class lm_agent:
             for idx in range(0, len(obj_map_indices[0])):
                 i, j = obj_map_indices[0][idx], obj_map_indices[1][idx]
                 id = self.id_map[i, j]
-                if (id in self.satisfied or id in self.holding_objects_id or
+                if ((id in self.satisfied and not self._uses_common_v4_policy()) or id in self.holding_objects_id or
                         id in self.oppo_holding_objects_id or
                         (self.fix_lm_satisfied and id in self.with_oppo) or
                         self.object_info[id] in object_list[object_type]):
@@ -468,7 +472,7 @@ class lm_agent:
         for o_dict in self.visible_objects:
             if o_dict['id'] is None: continue
             self.color2id[o_dict['seg_color']] = o_dict['id']
-            if (o_dict['id'] is None or o_dict['id'] in self.satisfied or
+            if (o_dict['id'] is None or (o_dict['id'] in self.satisfied and not self._uses_common_v4_policy()) or
                     o_dict['id'] in self.with_character or
                     (self.fix_lm_satisfied and o_dict['id'] in self.with_oppo) or
                     o_dict['type'] == 4):
@@ -493,7 +497,7 @@ class lm_agent:
                         if oppo_last_room is not None:
                             self.oppo_last_room = oppo_last_room
                 continue
-            if (object_id in self.satisfied or object_id in self.with_character or
+            if ((object_id in self.satisfied and not self._uses_common_v4_policy()) or object_id in self.with_character or
                     (self.fix_lm_satisfied and object_id in self.with_oppo)):
                 continue
             self.object_info[object_id]['position'] = position
@@ -854,6 +858,7 @@ class lm_agent:
         return result
 
     def act(self, obs):
+        self._peer_consult_validation_error = None
         # The V4 Harness monitors *planner* retries, not the low-level motion
         # commands emitted while one CoELA plan is executing.  Publish an
         # edge-triggered adapter marker and the selected semantic plan so the
@@ -975,8 +980,9 @@ class lm_agent:
         ignore_obstacles = self.with_character + ignore_obstacles
         ignore_ids = self.with_character + ignore_ids
         ignore_ids = temp_with_oppo + ignore_ids
-        ignore_ids += self.satisfied
-        ignore_obstacles += self.satisfied
+        if not self._uses_common_v4_policy():
+            ignore_ids += self.satisfied
+            ignore_obstacles += self.satisfied
 
         self.agent_memory.update(
             obs, ignore_ids=ignore_ids, ignore_obstacles=ignore_obstacles, save_img = self.save_img
@@ -1012,6 +1018,9 @@ class lm_agent:
                     raise Exception(f"retrying LM_plan too many times")
                 plan, a_info = self.LLM_plan()
                 if plan is None: # NO AVAILABLE PLANS! Explore from scratch!
+                    if self._uses_common_v4_policy():
+                        self._peer_consult_validation_error = (
+                            a_info.get("parse_exception") or "no model action selected")
                     print("No more things to do!")
                     plan = f"[wait]"
                 if not plan_allowed_for_role(self.agent_role, plan):
@@ -1043,7 +1052,8 @@ class lm_agent:
                 action = {"type": 6,
                           "message": ' '.join(self.plan.split(' ')[3:])}
                 self.plan = None
-            elif (self.plan.startswith('wait') or
+            elif (self.plan == 'release current task' or
+                  self.plan.startswith('wait') or
                   self.plan.startswith('[wait]')):
                 # The environment provides a one-frame no-op for both
                 # embodiments.  This also makes the legacy human fallback

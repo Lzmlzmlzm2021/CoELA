@@ -197,6 +197,10 @@ def main():
               "and conflict checking for two Replicants"),
     )
     parser.add_argument(
+        "--peer_consult_policy", choices=("llm", "legacy"), default="llm",
+        help="PeerConsultV4: use the shared LLM-owned core (default), or reproduce the historical V4 policy",
+    )
+    parser.add_argument(
         "--peer_review_mode", choices=("deterministic",),
         default="deterministic",
     )
@@ -220,7 +224,7 @@ def main():
               "plan-progress recovery and episode-isolated shared evidence; "
               "PeerConsultV4 keeps the original CoELA executor while adding "
               "complete legal candidates, persistent tasks, atomic factual "
-              "coordination and a benchmark-neutral planning-loop guard"),
+              "coordination; --peer_consult_policy selects common LLM policy or historical guards"),
     )
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--no_gt_mask", action='store_true')
@@ -301,7 +305,11 @@ def main():
     coordinator = None
     if args.peer_consult:
         from peer_consult import TDWPeerConsultCoordinator
-        coordinator = TDWPeerConsultCoordinator(
+        coordinator_class = TDWPeerConsultCoordinator
+        if args.peer_consult_protocol == "PeerConsultV4" and args.peer_consult_policy == "llm":
+            from peer_consult_common import CommonTDWPeerConsultCoordinator
+            coordinator_class = CommonTDWPeerConsultCoordinator
+        coordinator = coordinator_class(
             agents=agents,
             logger=logger,
             output_dir=args.output_dir,
