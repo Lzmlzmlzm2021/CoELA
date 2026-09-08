@@ -170,6 +170,8 @@ class AgentMemory():
         self.get_object_list()
         local_known_map = self.dep2map()
         self.known_map = np.maximum(self.known_map, local_known_map)
+        # Preserve the published CoELA update order. In particular, the first
+        # depth projection of a frame occurs before the new pose is assigned.
         self.position = self.obs["agent"][:3]
         self.forward = self.obs["agent"][3:]
         if self.local_step % SPACE_UPDATE_FREQ == 0:
@@ -215,7 +217,7 @@ class AgentMemory():
         x = i * CELL_SIZE + self._scene_bounds["x_min"]
         z = j * CELL_SIZE + self._scene_bounds["z_min"]
         return x, z
-    
+
     def get_pc(self, color) -> np.ndarray:
         depth = self.obs['depth'].copy()
         mask = np.any(self.obs['seg_mask'] != color, axis=-1)
@@ -322,23 +324,49 @@ class AgentMemory():
 
     
     def color2id_fc_vectorized(self, seg_mask):
-        # Flatten the seg_mask for vectorized operation
-        flat_seg_mask = seg_mask.reshape(-1, seg_mask.shape[-1])
-        # Convert colors to a tuple for dictionary key lookups
-        colors = list(map(tuple, flat_seg_mask))
+        """Map RGB segmentation colors with work proportional to unique colors.
 
-        # Prepare an array to store the results
-        color_ids = np.full(flat_seg_mask.shape[0], -100)  # default to wall or opposite agent
+        A frame contains hundreds of thousands of pixels but normally only a
+        few dozen colors. Packing valid RGB triplets into uint32 values lets
+        NumPy deduplicate the frame; Python dictionary lookup is then required
+        only once per unique color. Invalid detector sentinels (for example
+        ``[-1, -1, -1]``) remain unknown instead of aliasing white after an
+        unsigned cast.
+        """
 
-        # Check for agent color and assign the agent ID
-        is_agent = np.all(flat_seg_mask == self.agent_color, axis=1)
-        color_ids[is_agent] = self.agent_id
+        flat_seg_mask = np.asarray(seg_mask).reshape(-1, seg_mask.shape[-1])
+        if flat_seg_mask.shape[1] != 3:
+            raise ValueError("seg_mask must contain RGB triplets")
+        color_ids = np.full(flat_seg_mask.shape[0], -100, dtype=np.int64)
 
-        # Process other colors
-        for idx, color in enumerate(colors):
-            if color in self.color2id:
-                color_ids[idx] = self.color2id[color]
+        valid_rgb = np.all((flat_seg_mask >= 0) &
+                           (flat_seg_mask <= 255), axis=1)
+        if np.any(valid_rgb):
+            rgb = flat_seg_mask[valid_rgb].astype(np.uint32, copy=False)
+            packed = ((rgb[:, 0] << np.uint32(16)) |
+                      (rgb[:, 1] << np.uint32(8)) |
+                      rgb[:, 2])
+            unique_colors, inverse = np.unique(packed, return_inverse=True)
+            unique_ids = np.full(unique_colors.shape, -100, dtype=np.int64)
+            for index, packed_color in enumerate(unique_colors):
+                value = int(packed_color)
+                color = ((value >> 16) & 255,
+                         (value >> 8) & 255,
+                         value & 255)
+                if color in self.color2id:
+                    unique_ids[index] = self.color2id[color]
+            color_ids[np.flatnonzero(valid_rgb)] = unique_ids[inverse]
 
+        # Match the published loop order: mark the avatar first, then allow a
+        # color-table entry to override it. This preserves upstream semantics
+        # while retaining the unique-color speedup.
+        is_agent = np.all(flat_seg_mask == np.asarray(self.agent_color), axis=1)
+        agent_indices = np.flatnonzero(is_agent)
+        color_ids[agent_indices] = self.agent_id
+        agent_color = tuple(int(value) for value in np.asarray(
+            self.agent_color).tolist())
+        if agent_color in self.color2id:
+            color_ids[agent_indices] = self.color2id[agent_color]
         return color_ids.reshape(seg_mask.shape[:2])
 
     def color2id_fc(self, color):
