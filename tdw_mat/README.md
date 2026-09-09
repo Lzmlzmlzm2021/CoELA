@@ -1,7 +1,5 @@
 # TDW Multi-Agent Transport
 
-PeerConsult V4: [common LLM policy, matched legacy runs, and local tests](doc/COMMON_V4.md).
-
 > Repository note: first editon that added replicant working with a box.
 
 ## Codebase Layouts 

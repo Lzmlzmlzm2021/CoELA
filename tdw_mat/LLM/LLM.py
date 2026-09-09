@@ -518,21 +518,6 @@ class LLM:
 
 
     def parse_answer(self, available_actions, text):
-        if (getattr(self, "peer_consult_protocol", None) == "PeerConsultV4" and
-                getattr(self, "peer_consult_policy", "legacy") == "llm"):
-            matches = [action for action in available_actions
-                       if action.lower() in str(text).lower()]
-            if len(matches) == 1:
-                return matches[0], "AC"
-            labels = re.findall(r"\b(?:option|action)\s+([A-Z])\b|^\s*([A-Z])[.)]?\s*$",
-                                str(text), flags=re.IGNORECASE)
-            indices = {ord((left or right).upper()) - ord("A")
-                       for left, right in labels}
-            if len(indices) == 1:
-                index = indices.pop()
-                if index in range(len(available_actions)):
-                    return available_actions[index], "AC"
-            return None, "invalid_or_ambiguous_model_selection"
         flags = 'AC'
         for i in range(len(available_actions)):
             action = available_actions[i]
@@ -782,7 +767,6 @@ class LLM:
         task_rows = ((task_card or {}).get("task_queue") or [])
         is_v4 = (getattr(self, "peer_consult_protocol", None) ==
                  "PeerConsultV4")
-        common_v4 = is_v4 and getattr(self, "peer_consult_policy", "legacy") == "llm"
         # A target whose lifecycle has already advanced beyond acquisition
         # must never re-enter the grasp menu.  In particular, ``carried``
         # objects are still present in the V3.3 task queue and can remain in a
@@ -883,7 +867,7 @@ class LLM:
                 if room == self.current_room or room is None or room == 'None':
                     continue
                 available_plans.append(f"go to {room}")
-            if (common_v4 or self.current_room not in self.rooms_explored or
+            if (self.current_room not in self.rooms_explored or
                     self.rooms_explored[self.current_room] != 'all' or
                     (locating_bed and shared_bed_room == self.current_room)):
                 available_plans.append(f"explore current room {self.current_room}")
@@ -897,17 +881,13 @@ class LLM:
                     f"explore current room {self.current_room}")
         if agent_role == "scout":
             available_plans.append("wait")
-        elif common_v4:
-            available_plans.append("wait")
-        if common_v4:
-            available_plans.append("release current task")
 
         # Defense in depth: even future plan generators cannot accidentally
         # expose a manipulation plan to the Box Scout.
         available_plans = [plan for plan in available_plans
                            if plan_allowed_for_role(agent_role, plan)]
 
-        if is_v4 and not common_v4:
+        if is_v4:
             # Persistence is not insistence.  Only a genuinely active task
             # receives the stable continuity position.  Suspended/blocked
             # tasks and a task referenced by the one-boundary planning-loop
@@ -1071,7 +1051,6 @@ class LLM:
             "PeerConsultV3.3", "PeerConsultV3.4", "PeerConsultV3.5")
         is_v34 = protocol in ("PeerConsultV3.4", "PeerConsultV3.5")
         is_v4 = protocol == "PeerConsultV4"
-        common_v4 = is_v4 and getattr(self, "peer_consult_policy", "legacy") == "llm"
         decision_first_communication = is_v33 or is_v4
         if is_v33:
             prompt += (
@@ -1082,16 +1061,6 @@ class LLM:
                 "or a blocking review. A communication slot is optional: "
                 "choose 'send a message' only when the listed new event would "
                 "change the peer's next action, and never repeat a fact."
-            )
-        elif common_v4:
-            prompt += (
-                "\nPeerConsultV4 common policy: choose your own task, recovery, retry, "
-                "exploration and waiting strategy. Previous failures and coverage are "
-                "evidence, never a ban on another attempt. Wait preserves your task; "
-                "release current task explicitly withdraws your commitment. A scored "
-                "object stays scored if moved again. Consult common_core for execution "
-                "results, peer commitments, and cooperation proposals. A proposal or "
-                "ready statement is not an observed world fact."
             )
         elif is_v4:
             prompt += (
@@ -1226,24 +1195,6 @@ class LLM:
                     ". Do not restate your destination, room search, or "
                     "container intent if the peer already knows it."
                 )
-            elif common_v4:
-                card = getattr(self, "peer_decision_card", None) or {}
-                gen_prompt += (
-                    "\nChoose a public event with coordination_event:<event_id>, or "
-                    "write coordination_intent: followed by one JSON object. To propose "
-                    "cooperation use {\"kind\":\"propose\",\"participants\":[0,1],"
-                    "\"description\":\"your request\",\"conditions\":[]}; optional keys "
-                    "task_id and location express your proposal. To respond use "
-                    "{\"kind\":\"accept\",\"intent_id\":\"existing ID\"}; kinds decline, "
-                    "ready and cancel also reference an existing intent_id. To withdraw "
-                    "your work use {\"kind\":\"release_work\"}; it waits for running "
-                    "execution to end. Speak only "
-                    "for yourself. Proposals and ready statements do not establish facts. "
-                    "Public events: " + json.dumps(card.get("coordination_events", [])) +
-                    " Cooperation state: " + json.dumps(card.get("common_core", {}).get("coordination", []))
-                )
-                v4_event_ids = [event["event_id"] for event in card.get("coordination_events", [])
-                                if event.get("event_id") is not None]
             elif is_v4:
                 events = ((getattr(self, "peer_decision_card", None) or {})
                           .get("coordination_events", []))
@@ -1283,20 +1234,9 @@ class LLM:
             if is_v4:
                 message = _v4_coordination_event_reference(
                     comm_outputs[0], v4_event_ids)
-                if common_v4 and message is None:
-                    raw_message = str(comm_outputs[0]).strip()
-                    if raw_message.startswith("coordination_intent:"):
-                        try:
-                            payload = json.loads(raw_message.split(":", 1)[1])
-                            if isinstance(payload, dict):
-                                message = "coordination_intent:" + json.dumps(payload, ensure_ascii=False)
-                        except (ValueError, TypeError):
-                            pass
                 communication_guard = {
                     "accepted": message is not None,
-                    "reason": ("accepted_structured_intent"
-                               if message is not None and message.startswith("coordination_intent:")
-                               else "accepted_structured_event"
+                    "reason": ("accepted_structured_event"
                                if message is not None else
                                "invalid_structured_event_reference"),
                     "sender_role": self.agent_role,
