@@ -133,6 +133,9 @@ dmypy.json
 .idea/
 *.pyc
 config.ini
+lmstudio.json
+server_info.txt
+run_config.local.json
 
 output/
 .config/

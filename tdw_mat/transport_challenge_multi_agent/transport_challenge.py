@@ -1,15 +1,18 @@
 from csv import DictReader
 from typing import List, Dict, Union, Tuple, Optional
-from subprocess import run, PIPE
+from subprocess import run, PIPE, Popen
 from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 from tdw.version import __version__
 from tdw.controller import Controller
+from tdw.release.build import Build
 from tdw.tdw_utils import TDWUtils
 from tdw.add_ons.floorplan import Floorplan
 from tdw.add_ons.replicant import Replicant
-from tdw.librarian import HumanoidLibrarian
+from tdw.librarian import (HDRISkyboxLibrarian, HumanoidAnimationLibrarian,
+                           HumanoidLibrarian, MaterialLibrarian,
+                           ModelLibrarian, SceneLibrarian)
 from tdw.add_ons.occupancy_map import OccupancyMap
 from tdw.add_ons.interior_scene_lighting import InteriorSceneLighting
 from tdw.add_ons.object_manager import ObjectManager
@@ -19,12 +22,125 @@ from tdw.replicant.action_status import ActionStatus
 from tdw.scene_data.scene_bounds import SceneBounds
 from transport_challenge_multi_agent.challenge_state import ChallengeState
 from transport_challenge_multi_agent.replicant_transport_challenge import ReplicantTransportChallenge
+from transport_challenge_multi_agent.box_scout import BoxScoutAvatar
 from transport_challenge_multi_agent.paths import CONTAINERS_PATH, TARGET_OBJECTS_PATH, TARGET_OBJECT_MATERIALS_PATH
 from transport_challenge_multi_agent.globals import Globals
 from transport_challenge_multi_agent.asset_cached_controller import AssetCachedController
 from tdw.add_ons.logger import Logger
 import os
 import json
+import platform
+from urllib.parse import unquote, urlparse
+
+
+def _persist_generated_count_and_position(path: str, payload: dict,
+                                          enabled: bool) -> bool:
+    """Persist legacy generated placement data, never official metadata."""
+
+    if not enabled:
+        return False
+    with open(path, "w") as stream:
+        json.dump(payload, stream, indent=4)
+    return True
+
+
+def _configure_local_build() -> None:
+    """Keep the TDW build and Unity writable state in the D-drive runtime."""
+    build_path_value = os.getenv("TDW_BUILD_PATH")
+    if not build_path_value:
+        return
+
+    build_path = Path(build_path_value).expanduser().resolve()
+    build_root = Path(os.getenv("TDW_BUILD_ROOT", str(build_path.parents[1]))).expanduser().resolve()
+    unity_log = Path(os.getenv("TDW_UNITY_LOG_PATH", str(build_root.joinpath("logs", "Player.log")))).expanduser().resolve()
+    crash_dir = Path(os.getenv("TDW_UNITY_CRASH_DIR", str(unity_log.parent.joinpath("crashes")))).expanduser().resolve()
+    unity_home_value = os.getenv("TDW_UNITY_HOME")
+
+    Build.BUILD_ROOT_DIR = build_root
+    Build.BUILD_PATH = build_path
+
+    def launch_build_from_runtime(port: int = 1071) -> None:
+        if not build_path.is_file():
+            raise FileNotFoundError(
+                f"TDW build not found at {build_path}. Run tdw_mat_setup/download_assets.ps1 first."
+            )
+        unity_log.parent.mkdir(parents=True, exist_ok=True)
+        crash_dir.mkdir(parents=True, exist_ok=True)
+        child_env = os.environ.copy()
+        if unity_home_value:
+            unity_home = Path(unity_home_value).expanduser().resolve()
+            local_app_data = unity_home.joinpath("AppData", "Local")
+            roaming_app_data = unity_home.joinpath("AppData", "Roaming")
+            child_temp = unity_home.joinpath("Temp")
+            for directory in (unity_home, local_app_data, roaming_app_data, child_temp):
+                directory.mkdir(parents=True, exist_ok=True)
+            child_env.update({
+                "USERPROFILE": str(unity_home),
+                "LOCALAPPDATA": str(local_app_data),
+                "APPDATA": str(roaming_app_data),
+                "TEMP": str(child_temp),
+                "TMP": str(child_temp),
+            })
+        Popen(
+            [str(build_path), "-port " + str(port), "-logFile", str(unity_log),
+             "-crash-report-folder", str(crash_dir)],
+            cwd=str(build_path.parent),
+            env=child_env,
+        )
+
+    # TDW's stock launcher downloads missing builds to Path.home(). The
+    # deployment must never fall back to that C-drive path.
+    Controller.launch_build = staticmethod(launch_build_from_runtime)
+
+
+def _register_local_asset_libraries() -> None:
+    """Register the official Windows transport bundle at its actual D path.
+
+    The published catalogs contain stale, hard-coded ``file:///D:/...`` URLs
+    and lower-case platform keys. Load the catalog metadata, then replace only
+    the active Windows URL in memory. The source JSON files remain untouched.
+    """
+    root_value = os.getenv("TDW_LOCAL_ASSET_BUNDLE_ROOT")
+    if not root_value:
+        return
+    if platform.system() != "Windows":
+        raise RuntimeError("The supplied local transport bundle contains Windows asset bundles only.")
+
+    root = Path(root_value).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"Local transport assets not found at {root}. Run tdw_mat_setup/download_assets.ps1 first."
+        )
+
+    library_specs = (
+        (SceneLibrarian, Controller.SCENE_LIBRARIANS, "scenes.json", "scenes"),
+        (ModelLibrarian, Controller.MODEL_LIBRARIANS, "models_core.json", "models_core"),
+        (HDRISkyboxLibrarian, Controller.HDRI_SKYBOX_LIBRARIANS,
+         "hdri_skyboxes.json", "hdri_skyboxes"),
+        (MaterialLibrarian, Controller.MATERIAL_LIBRARIANS,
+         "materials_low.json", "materials_low"),
+        (HumanoidAnimationLibrarian, Controller.HUMANOID_ANIMATION_LIBRARIANS,
+         "humanoid_animations.json", "humanoid_animations"),
+    )
+
+    for librarian_type, registry, library_key, directory_name in library_specs:
+        directory = root.joinpath(directory_name)
+        catalog = directory.joinpath(library_key)
+        if not catalog.is_file():
+            raise FileNotFoundError(f"Local TDW catalog is missing: {catalog}")
+        librarian = librarian_type(str(catalog))
+        for record in librarian.records:
+            source_url = (record.urls.get("Windows") or
+                          record.urls.get("windows") or
+                          record.urls.get(platform.system()))
+            source_name = Path(unquote(urlparse(source_url).path)).name if source_url else record.name
+            asset_path = directory.joinpath(source_name).resolve()
+            if not asset_path.is_file():
+                raise FileNotFoundError(
+                    f"Local asset for {record.name!r} is missing: {asset_path}"
+                )
+            record.urls["Windows"] = asset_path.as_uri()
+        registry[library_key] = librarian
 
 
 class TransportChallenge(AssetCachedController):
@@ -45,7 +161,9 @@ class TransportChallenge(AssetCachedController):
     """:class_var
     The expected version of TDW.
     """
-    TDW_VERSION: str = "1.11.18"
+    # requirements.txt pins tdw==1.11.23.5, whose public API/build version is
+    # 1.11.23. The old 1.11.18 constant produced a false mismatch warning.
+    TDW_VERSION: str = "1.11.23"
     """:class_var
     The goal zone is a circle defined by `self.goal_center` and this radius value.
     """
@@ -66,6 +184,9 @@ class TransportChallenge(AssetCachedController):
         :param target_framerate: The target framerate. It's possible to set a higher target framerate, but doing so can lead to a loss of precision in agent movement.
         """
 
+        _configure_local_build()
+        _register_local_asset_libraries()
+        asset_cache_dir = os.getenv("TDW_ASSET_CACHE_DIR", asset_cache_dir)
         try:
             q = run(["git", "rev-parse", "--show-toplevel"], stdout=PIPE)
             p = Path(str(q.stdout.decode("utf-8").strip())).resolve()
@@ -86,6 +207,8 @@ class TransportChallenge(AssetCachedController):
         A dictionary of all Replicants in the scene. Key = The Replicant ID. Value = [`ReplicantTransportChallenge`](replicant_transport_challenge.md).
         """
         self.replicants: Dict[int, ReplicantTransportChallenge] = dict()
+        self.box_scouts: Dict[int, BoxScoutAvatar] = dict()
+        self.agents: Dict[int, object] = dict()
         """:field
         The `ChallengeState`, which includes container IDs, target object IDs, containment state, and which Replicant is holding which objects.
         """
@@ -139,7 +262,8 @@ class TransportChallenge(AssetCachedController):
                               container_room_index: int = None, target_objects_room_index: int = None,
                               goal_room_index: int = None, task = None,
                               replicants: Union[int, List[Union[int, np.ndarray, Dict[str, float]]]] = 2,
-                              lighting: bool = True, random_seed: int = None, data_prefix = 'dataset/dataset_train') -> None:
+                              lighting: bool = True, random_seed: int = None, data_prefix = 'dataset/dataset_train',
+                              embodiments: Optional[List[str]] = None) -> None:
         """
         Start a trial in a floorplan scene.
 
@@ -168,7 +292,8 @@ class TransportChallenge(AssetCachedController):
         self.layout = layout
         self.task = task
         self.data_prefix = data_prefix
-        self._start_trial_new(replicants=replicants, task_type = task, random_seed=random_seed)
+        self._start_trial_new(replicants=replicants, task_type = task, random_seed=random_seed,
+                              embodiments=embodiments)
 
 
     # def start_box_room_trial(self, size: Tuple[int, int], num_containers: int, num_target_objects: int,
@@ -201,7 +326,7 @@ class TransportChallenge(AssetCachedController):
         #print(commands)
         return super().communicate(commands)
 
-    def _start_trial_new(self, replicants: Union[int, List[Union[int, np.ndarray, Dict[str, float]]]] = 2, task_type = 'food', random_seed: int = None) -> None:
+    def _start_trial_new(self, replicants: Union[int, List[Union[int, np.ndarray, Dict[str, float]]]] = 2, task_type = 'food', random_seed: int = None, embodiments: Optional[List[str]] = None) -> None:
         """
         Start a trial in a floorplan scene.
         food or stuff
@@ -209,10 +334,19 @@ class TransportChallenge(AssetCachedController):
         self.communicate({"$type": "set_floorplan_roof", "show": False})
         load_path = os.path.join(self.data_prefix, f"{self.scene}_{self.layout}.json")
         with open(load_path, "r") as f: scene = json.load(f)
-        if os.path.exists(os.path.join(self.data_prefix, f"{self.scene}_{self.layout}_metadata.json")):
-            load_count_and_position_path = os.path.join(self.data_prefix, f"{self.scene}_{self.layout}_metadata.json")
+        metadata_path = os.path.join(
+            self.data_prefix, f"{self.scene}_{self.layout}_metadata.json")
+        if os.path.exists(metadata_path):
+            # Dataset metadata is an authoritative benchmark input.  Reset may
+            # fill missing in-memory positions for legacy/generated scenes,
+            # but it must never rewrite an official metadata file: doing so
+            # changes source hashes and makes a crash-safe resume impossible.
+            load_count_and_position_path = metadata_path
+            persist_count_and_position = False
         else:
-            load_count_and_position_path = os.path.join(self.data_prefix, f"{self.scene}_{self.layout}_count.json")
+            load_count_and_position_path = os.path.join(
+                self.data_prefix, f"{self.scene}_{self.layout}_count.json")
+            persist_count_and_position = True
         with open(load_count_and_position_path, "r") as f: count_and_position = json.load(f)
         common_sense_path = os.path.join(self.data_prefix, "list.json")
         with open(common_sense_path, "r") as f:
@@ -223,6 +357,8 @@ class TransportChallenge(AssetCachedController):
         if self.logger is not None:
             self.add_ons.append(self.logger)
         self.replicants.clear()
+        self.box_scouts.clear()
+        self.agents.clear()
         # Add an occupancy map.
         self.add_ons.append(self.occupancy_map)
         # Get the rooms.
@@ -268,42 +404,59 @@ class TransportChallenge(AssetCachedController):
                 replicant_positions[i] = count_and_position[str(i)]
             count_and_position[str(i)] = replicant_positions[i]
             
+        if embodiments is None:
+            embodiments = ["replicant"] * len(replicant_positions)
+        if len(embodiments) != len(replicant_positions):
+            raise ValueError("embodiments must match the number of logical agents")
         replicant_names = ["woman_casual", "man_casual"]
-        for i, replicant_position in enumerate(replicant_positions):
-            replicant = ReplicantTransportChallenge(replicant_id=i,
-                                                    state=self.state,
-                                                    position=replicant_position,
-                                                    image_frequency=self._image_frequency,
-                                                    target_framerate=self._target_framerate,
-                                                    enable_collision_detection=self.enable_collision_detection,
-                                                    name=replicant_names[i])
-            self.replicants[replicant.replicant_id] = replicant
-            self.add_ons.append(replicant)
+        for i, agent_position in enumerate(replicant_positions):
+            if embodiments[i] == "replicant":
+                replicant = ReplicantTransportChallenge(replicant_id=i,
+                                                        state=self.state,
+                                                        position=agent_position,
+                                                        image_frequency=self._image_frequency,
+                                                        target_framerate=self._target_framerate,
+                                                        enable_collision_detection=self.enable_collision_detection,
+                                                        name=replicant_names[i])
+                self.replicants[replicant.replicant_id] = replicant
+                self.agents[i] = replicant
+                self.add_ons.append(replicant)
+            elif embodiments[i] == "box":
+                scout = BoxScoutAvatar(agent_id=i,
+                                       position=agent_position,
+                                       image_frequency=self._image_frequency,
+                                       image_passes=self._image_passes,
+                                       target_framerate=self._target_framerate)
+                self.box_scouts[i] = scout
+                self.agents[i] = scout
+                self.add_ons.append(scout)
+            else:
+                raise ValueError(f"Unsupported embodiment: {embodiments[i]}")
         # Set the pass masks.
         # Add a challenge state and object manager.
         self.object_manager.reset()
         self.add_ons.extend([self.state, self.object_manager])
         self.communicate([])
-        commands = []
         for object_id in self.object_manager.objects_static.keys():
             if self.object_manager.objects_static[object_id].name in common_sense[task_type]['target']:
                 self.state.target_object_ids.append(object_id)
             if self.object_manager.objects_static[object_id].name in common_sense[task_type]['container']:
                 self.state.container_ids.append(object_id)
         for replicant_id in self.replicants:
-            # Set pass masks.
-            commands.append({"$type": "set_pass_masks",
-                             "pass_masks": self._image_passes,
-                             "avatar_id": self.replicants[replicant_id].static.avatar_id})
             # Ignore collisions with target objects.
             self.replicants[replicant_id].collision_detection.exclude_objects.extend(self.state.target_object_ids)
+        for scout in self.box_scouts.values():
+            scout.set_obstacle_ids(self.state.target_object_ids + self.state.container_ids)
         # Add a NavMesh.
         nav_mesh_exclude_objects = list(self.replicants.keys())
         nav_mesh_exclude_objects.extend(self.state.target_object_ids)
         nav_mesh = NavMesh(exclude_objects=nav_mesh_exclude_objects)
         self.add_ons.append(nav_mesh)
-        # Send the commands.
-        # self.communicate(commands)
+        # Advance once so each Replicant can create its image avatar and set
+        # its own pass masks in the correct add-on order. Sending an external
+        # set_pass_masks command here runs before the queued create_avatar and
+        # causes a Unity NullReferenceException on mixed Human+Box trials.
+        self.communicate([])
         # Reset the heads.
         for replicant_id in self.replicants:
             self.replicants[replicant_id].reset_head(scale_duration=Globals.SCALE_IK_DURATION)
@@ -326,10 +479,15 @@ class TransportChallenge(AssetCachedController):
                 goal_description[object_names[i]] = 1
         '''
 
-        # Save the position of agents.
-        with open(load_count_and_position_path, "w") as f:
-            json.dump(count_and_position, f, indent=4)
-        print(load_count_and_position_path, 'saved')
+        # Only the legacy/generated count-file path is mutable.  Official
+        # ``*_metadata.json`` files remain byte-for-byte read-only.
+        if _persist_generated_count_and_position(
+                load_count_and_position_path,
+                count_and_position,
+                enabled=persist_count_and_position):
+            print(load_count_and_position_path, 'saved')
+        else:
+            print(load_count_and_position_path, 'loaded read-only')
 
 
     # def _start_trial(self, num_containers: int, num_target_objects: int, container_room_index: int = None,

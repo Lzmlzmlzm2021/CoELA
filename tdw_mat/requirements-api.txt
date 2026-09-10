@@ -1,0 +1,22 @@
+# Minimal dependency set for TDW-MAT with GT masks and a remote
+# OpenAI-compatible LLM endpoint. It intentionally omits torch, transformers,
+# accelerate, mmdetection, and pycocotools.
+backoff==2.2.1
+gym==0.26.2
+matplotlib==3.6.3
+numpy==1.24.3
+openai==1.42.0
+# openai 1.42 still passes the removed `proxies` argument to httpx 0.28.
+httpx==0.27.2
+opencv_python_headless==4.7.0.68
+overrides==7.3.1
+pandas==1.5.3
+Pillow==10.4.0
+py_md_doc==0.5.1
+pyastar2d==1.0.6
+Requests==2.32.3
+scipy==1.10.1
+setuptools==60.2.0
+tdw==1.11.23.5
+tenacity==8.2.2
+tqdm==4.65.0
