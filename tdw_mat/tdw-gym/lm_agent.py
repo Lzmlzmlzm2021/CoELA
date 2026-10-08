@@ -117,7 +117,11 @@ class lm_agent:
         self.communication = args.communication
         self.cot = args.cot
         self.args = args
-        self.LLM = LLM(
+        planner_class = LLM
+        if getattr(args, 'planner', 'coela') == 'react':
+            from LLM.react import ReActLLM
+            planner_class = ReActLLM
+        self.LLM = planner_class(
             self.source,
             self.lm_id,
             self.prompt_template_path,
@@ -245,7 +249,8 @@ class lm_agent:
         V3.5 policy.  Keeping it behind a separate capability lets V4 reuse the
         reset safety without inheriting any V3.4/V3.5 executor behavior.
         """
-        return self._uses_v35_protocol() or self._uses_v4_protocol()
+        return (self._uses_v35_protocol() or self._uses_v4_protocol() or
+                getattr(getattr(self, 'args', None), 'planner', 'coela') == 'react')
 
     @staticmethod
     def _episode_provenance_from_output_dir(output_dir):
@@ -635,6 +640,8 @@ class lm_agent:
         self.navigation_threshold = 5
         # print(self.rooms_name)
         self.LLM.reset(self.rooms_name, self.goal_objects)
+        if getattr(getattr(self, 'args', None), 'planner', 'coela') == 'react':
+            self.LLM.set_output_dir(self.output_dir)
         self.save_img = save_img
 
     def _execute_room_navigation_plan(self):
@@ -837,6 +844,17 @@ class lm_agent:
         return obj_infos, curr_seg_mask
 
     def LLM_plan(self):
+        if getattr(getattr(self, 'args', None), 'planner', 'coela') == 'react':
+            return self.LLM.run(
+                self.num_frames, self.current_room, self.rooms_explored,
+                self.obs['held_objects'],
+                [self.object_info[x] for x in self.satisfied if x in self.object_info],
+                self.object_list, self.object_per_room, self.action_history,
+                self.dialogue_history, self.obs['oppo_held_objects'], self.oppo_last_room,
+                feedback={'last_low_level_action': self.last_action,
+                          'status': self.obs.get('status'),
+                          'valid': self.obs.get('valid'),
+                          'visible_objects': self.filtered(self.obs['visible_objects'])})
         # Some legacy/unit construction paths instantiate lm_agent without
         # running the modern __init__/reset sequence.  V3.4's event queue is
         # optional state for those paths, so treat an absent queue as empty.

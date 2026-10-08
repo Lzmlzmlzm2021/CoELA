@@ -228,6 +228,13 @@ def main():
     parser.add_argument('--source', default='openai',
         choices=['hf', 'openai'],
         help='openai API or load huggingface models')
+    parser.add_argument('--planner', choices=['coela', 'react'], default='coela')
+    parser.add_argument('--react_api_config', default=None)
+    parser.add_argument('--react_history', type=int, default=8)
+    parser.add_argument('--react_max_tokens', type=int, default=256)
+    parser.add_argument('--react_temperature', type=float, default=0.0)
+    parser.add_argument('--react_timeout', type=float, default=180)
+    parser.add_argument('--react_max_retries', type=int, default=2)
     parser.add_argument('--lm_id', default='gpt-3.5-turbo',
                         help='name for openai engine or huggingface model name/path')
     parser.add_argument('--prompt_template_path', default='LLM/prompt_single.csv',
@@ -249,6 +256,15 @@ def main():
               "to the exact dataset episode and frame limit"),
     )
     args = parser.parse_args()
+
+    if args.planner == 'react':
+        if args.peer_consult or args.source != 'openai' or args.cot:
+            parser.error('ReAct requires --source openai without --peer_consult or --cot')
+        if any(agent not in ('lm_agent', 'scout_agent') for agent in args.agents):
+            parser.error('ReAct requires lm_agent and/or scout_agent')
+        if (min(args.react_history, args.react_max_tokens, args.react_timeout) <= 0
+                or args.react_max_retries < 0):
+            parser.error('ReAct budgets must be positive; retries must be nonnegative')
 
     args.number_of_agents = len(args.agents)
     if args.embodiments is None:
