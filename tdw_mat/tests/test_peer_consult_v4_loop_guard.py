@@ -81,6 +81,14 @@ class ConsumingBoundaryAgent(BoundaryAgent):
 
 
 class PeerConsultV4LoopGuardTests(unittest.TestCase):
+    def test_coordinator_rejects_retired_protocols(self):
+        output = tempfile.TemporaryDirectory()
+        self.addCleanup(output.cleanup)
+        with self.assertRaisesRegex(ValueError, "unsupported peer-consult protocol"):
+            TDWPeerConsultCoordinator(
+                [FakeAgent(), FakeAgent()], logger=None,
+                output_dir=output.name, protocol_version="unsupported-protocol")
+
     def make_team(self, agents=None):
         agents = agents or [FakeAgent(), FakeAgent()]
         output = tempfile.TemporaryDirectory()
@@ -192,7 +200,7 @@ class PeerConsultV4LoopGuardTests(unittest.TestCase):
     def test_physical_evaluator_and_room_completion_emit_progress(self):
         agents = [FakeAgent(), FakeAgent()]
         board = TDWSharedBlackboard(
-            {"apple": 1}, mechanism_v4=True, episode_epoch=1)
+            {"apple": 1}, episode_epoch=1)
         apple = {"id": 10, "type": 0, "name": "apple"}
         held_apple = dict(apple, contained=[None, None, None],
                           contained_name=[None, None, None])
@@ -214,6 +222,19 @@ class PeerConsultV4LoopGuardTests(unittest.TestCase):
                       delivered_objects={10: "apple"})
         self.assertGreater(
             board.task_progress_versions["room:<Kitchen> (1000)"], 0)
+
+    def test_shared_bed_is_published_with_episode_identity(self):
+        board = TDWSharedBlackboard({"apple": 1}, episode_epoch=3)
+        board.known_entities[99] = {
+            "id": 99, "name": "bed", "type": 2,
+            "position": [1.0, 0.0, 2.0], "room": "<Bedroom> (1000)",
+        }
+        card = board.decision_view(
+            0, state(0), [FakeAgent(), FakeAgent()],
+            {"remaining_frames": 2900},
+        )
+        self.assertEqual(card["delivery_target"]["id"], 99)
+        self.assertEqual(card["delivery_target"]["episode_epoch"], 3)
 
     def test_guard_ignores_ongoing_and_is_consumed_by_next_boundary(self):
         team = self.make_team()
@@ -381,7 +402,7 @@ class PeerConsultV4LoopGuardTests(unittest.TestCase):
 
     def test_v4_task_switch_and_idle_release_abandoned_object_claim(self):
         board = TDWSharedBlackboard(
-            {"apple": 2}, mechanism_v4=True, episode_epoch=1)
+            {"apple": 2}, episode_epoch=1)
         for object_id in (10, 11):
             board.known_entities[object_id] = {
                 "id": object_id, "type": 0, "name": "apple"}
@@ -454,8 +475,6 @@ class PeerConsultV4LoopGuardTests(unittest.TestCase):
                 "distance_m", "confidence", "estimated_delivery_frames",
                 "container_used_slots", "bed_distance_m"):
             self.assertNotIn(forbidden, serialized)
-        self.assertFalse(agents[0].stable_task_protocol)
-        self.assertFalse(agents[0].coverage_exploration)
 
     def test_v4_factual_branch_does_not_call_policy_governors(self):
         agents = [
@@ -590,7 +609,7 @@ class PeerConsultV4LoopGuardTests(unittest.TestCase):
 
     def test_coordination_events_are_structured_and_observation_free(self):
         board = TDWSharedBlackboard(
-            {"apple": 1}, mechanism_v4=True, episode_epoch=1)
+            {"apple": 1}, episode_epoch=1)
         board.frame = 12
         board.known_entities[10] = {
             "id": 10, "type": 0, "name": "apple",

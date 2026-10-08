@@ -110,6 +110,24 @@ class V4CandidateCompletenessTests(unittest.TestCase):
         self.assertIn("go grasp target object <apple> (10)", plans)
         self.assertIn("go grasp container <bowl> (20)", plans)
 
+    def test_shared_bed_keeps_transport_available_without_local_bed(self):
+        planner = self.make_planner()
+        planner.object_list[2] = []
+        planner.holding_objects[0] = {
+            "id": 10, "name": "apple", "type": 0,
+            "contained": [None, None, None],
+        }
+        _, _, without_bed = planner.get_available_plans()
+        self.assertNotIn("transport objects I'm holding to the bed", without_bed)
+        self.assertIn("go to Bedroom", without_bed)
+
+        planner.peer_decision_card["delivery_target"] = {
+            "id": 12, "name": "bed", "type": 2,
+            "position": [1.0, 0.0, 2.0], "room": "Bedroom",
+        }
+        _, _, with_bed = planner.get_available_plans()
+        self.assertIn("transport objects I'm holding to the bed", with_bed)
+
     def test_v4_message_is_a_planning_candidate_not_a_prefetch_call(self):
         planner, calls = self.make_runnable_planner()
 
@@ -132,25 +150,6 @@ class V4CandidateCompletenessTests(unittest.TestCase):
             "The apple is 2.1 meters away at [1, 0, 4].", [7]))
         self.assertIsNone(_v4_coordination_event_reference(
             "coordination_event:99", [7]))
-
-    def test_v35_action_space_is_unchanged(self):
-        planner = self.make_planner("PeerConsultV3.5")
-
-        _, _, plans = planner.get_available_plans()
-
-        self.assertIn("go grasp target object <apple> (10)", plans)
-        self.assertNotIn("go to Bedroom", plans)
-        self.assertNotIn("explore current room Kitchen", plans)
-
-    def test_v35_card_remains_a_shared_object_whitelist(self):
-        planner = self.make_planner("PeerConsultV3.5")
-        planner.peer_decision_card["task_queue"] = [
-            planner.peer_decision_card["task_queue"][0]]
-
-        _, _, plans = planner.get_available_plans()
-
-        self.assertIn("go grasp target object <banana> (11)", plans)
-        self.assertNotIn("go grasp target object <apple> (10)", plans)
 
     def test_active_task_gets_non_binding_continuity_order(self):
         planner = self.make_planner()

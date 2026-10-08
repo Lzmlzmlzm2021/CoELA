@@ -192,9 +192,8 @@ def main():
     parser.add_argument("--communication", action='store_true')
     parser.add_argument(
         "--peer_consult", action='store_true',
-        help=("enable the evidence-centric Memory Board, short-lived intents, "
-              "container-aware transport evidence, selective peer review "
-              "and conflict checking for two Replicants"),
+        help=("enable PeerConsult V4 with shared bed delivery target, "
+              "persistent tasks and atomic coordination for two Replicants"),
     )
     parser.add_argument(
         "--peer_review_mode", choices=("deterministic",),
@@ -202,25 +201,9 @@ def main():
     )
     parser.add_argument(
         "--peer_consult_protocol",
-        choices=("PeerConsultV3", "PeerConsultV3.1", "PeerConsultV3.2",
-                 "PeerConsultV3.3", "PeerConsultV3.4",
-                 "PeerConsultV3.5", "PeerConsultV4"),
-        default="PeerConsultV3",
-        help=("PeerConsultV3.1 keeps the V3 Memory Board but gates natural "
-              "language on physical events, debounces room reassignment, "
-              "and prioritizes delivery before the frame budget is unsafe; "
-              "PeerConsultV3.2 additionally reconciles planner delivery "
-              "memory with evaluator evidence and commits bankable payloads; "
-              "PeerConsultV3.3 adds persistent task scheduling, decision-first "
-              "communication, coverage exploration and evaluator-confirmed "
-              "safe delivery without the V3.2 direct-drop override; "
-              "PeerConsultV3.4 reconciles shared delivery knowledge, payload "
-              "identity, parked containers and persistent perception events; "
-              "PeerConsultV3.5 retains those semantics while adding bounded "
-              "plan-progress recovery and episode-isolated shared evidence; "
-              "PeerConsultV4 keeps the original CoELA executor while adding "
-              "complete legal candidates, persistent tasks, atomic factual "
-              "coordination and a benchmark-neutral planning-loop guard"),
+        choices=("PeerConsultV4",),
+        default="PeerConsultV4",
+        help="the only supported PeerConsult protocol",
     )
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--no_gt_mask", action='store_true')

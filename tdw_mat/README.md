@@ -2,6 +2,15 @@
 
 > Repository note: first editon that added replicant working with a box.
 
+## PeerConsult V4 sharing bed
+
+The only supported PeerConsult mode is `PeerConsultV4`. Enable it for two
+Replicant LLM agents with `--agents lm_agent lm_agent --communication
+--peer_consult`; shared bed delivery is enabled by default. Omit
+`--peer_consult` to run the original CoELA baseline. See
+[the V4 implementation guide](doc/REPRODUCTION_V4.md) and
+[the cleanup report](doc/V4_SHARING_BED_CLEANUP_REPORT.md).
+
 ## Codebase Layouts 
 
 ```

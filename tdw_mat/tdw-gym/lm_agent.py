@@ -57,12 +57,8 @@ class lm_agent:
         # In corrected mode, `satisfied` means locally confirmed delivery only;
         # teammate-held and invalid objects use separate temporary/ignore state.
         self.fix_lm_satisfied = _env_flag_enabled("TDW_MAT_FIX_LM_SATISFIED")
-        # PeerConsult V3.2 can promote evaluator-confirmed delivery to the
-        # sole source of truth.  The coordinator enables this per protocol so
-        # legacy and earlier ablation behavior remains unchanged.
+        # The V4 coordinator reconciles delivery against evaluator progress.
         self.authoritative_satisfied = False
-        self.stable_task_protocol = False
-        self.coverage_exploration = False
         self.object_list = None
         self.container_held = None
         self.gt_mask = None
@@ -94,10 +90,6 @@ class lm_agent:
         self.debug = True
 
         self.new_object_list = None
-        # V3.4 keeps first-observation events until an LLM decision boundary.
-        # This is separate from ``new_object_list``, which is intentionally a
-        # one-step legacy compatibility view.
-        self.pending_perception_events = []
         self.visible_objects = None
         self.num_frames = None
         self.steps = None
@@ -209,200 +201,69 @@ class lm_agent:
                 visible_obj.append(o)
         return visible_obj
 
-    def _uses_v34_protocol(self):
-        return getattr(self.LLM, "peer_consult_protocol", None) in (
-            "PeerConsultV3.4", "PeerConsultV3.5")
-
-    def _uses_v35_protocol(self):
-        return (getattr(self.LLM, "peer_consult_protocol", None) ==
-                "PeerConsultV3.5")
-
     def _uses_v4_protocol(self):
-        """Return whether the policy-light V4 Harness is active.
-
-        V4 deliberately isn't folded into either of the legacy version
-        helpers above.  Those helpers select V3.4/V3.5 perception, navigation,
-        container and recovery semantics that aren't part of the V4 Core.
-        """
-        return (getattr(self.LLM, "peer_consult_protocol", None) ==
-                "PeerConsultV4")
-
-    def _uses_shared_delivery_target_adapter(self):
-        """Return whether a verified shared task target may feed executor IO.
-
-        V3.4/V3.5 retain their published behavior.  V4 exposes the same
-        factual bridge only under an explicit adapter flag so its original
-        executor-isolation ablation remains reproducible.
-        """
-        return (self._uses_v34_protocol() or
-                (self._uses_v4_protocol() and
-                 os.getenv("TDW_MAT_V4_SHARED_DELIVERY_TARGET", "0") == "1"))
+        return getattr(self.LLM, "peer_consult_protocol", None) == "PeerConsultV4"
 
     def _uses_episode_isolation_protocol(self):
-        """Protocols whose planner views must be cleared between episodes.
-
-        Episode isolation is a protocol-agnostic correctness invariant, not a
-        V3.5 policy.  Keeping it behind a separate capability lets V4 reuse the
-        reset safety without inheriting any V3.4/V3.5 executor behavior.
-        """
-        return self._uses_v35_protocol() or self._uses_v4_protocol()
+        return self._uses_v4_protocol()
 
     @staticmethod
     def _episode_provenance_from_output_dir(output_dir):
-        """Return a stable, local-only episode identity for cached evidence."""
         if output_dir is None:
             return None
         return os.path.normcase(os.path.abspath(os.fspath(output_dir)))
 
     @staticmethod
     def _is_shared_bed_record(record):
-        return (record.get("knowledge_source") ==
-                "shared_memory_board")
+        return record.get("knowledge_source") == "shared_memory_board"
 
-    def _prune_v35_shared_beds(self):
-        """Drop stale shared beds and let genuine local perception win."""
-        beds = list((self.object_list or {}).get(2, []))
-        local_beds = [record for record in beds
-                      if not self._is_shared_bed_record(record)]
-        if local_beds:
-            retained = local_beds
-        else:
-            retained = [
-                record for record in beds
-                if (record.get("episode_provenance") ==
-                    self.episode_provenance)
-            ]
+    def _prune_shared_beds(self):
+        """Prefer direct perception and discard cached beds from prior episodes."""
+        beds = list(self.object_list.get(2, []))
+        local_beds = [bed for bed in beds if not self._is_shared_bed_record(bed)]
+        retained = local_beds or [
+            bed for bed in beds
+            if bed.get("episode_provenance") == self.episode_provenance
+        ]
         self.object_list[2] = retained
-
-        # ``object_per_room`` is a second view over the same entities. Keep it
-        # consistent so a stale shared bed cannot survive in the prompt after
-        # the flat list has selected a locally observed bed.
-        retained_ids = {id(record) for record in retained}
-        for room_objects in (self.object_per_room or {}).values():
-            room_beds = list(room_objects.get(2, []))
+        retained_ids = {id(bed) for bed in retained}
+        for room_objects in self.object_per_room.values():
             room_objects[2] = [
-                record for record in room_beds
-                if (not self._is_shared_bed_record(record) or
-                    id(record) in retained_ids)
+                bed for bed in room_objects.get(2, [])
+                if not self._is_shared_bed_record(bed) or id(bed) in retained_ids
             ]
 
-    def _queue_perception_event(self, object_id):
-        """Persist a first observation until it is presented to V3.4's LLM."""
-        if not self._uses_v34_protocol():
+    def _inject_shared_bed(self):
+        """Adapt the V4 card's bed target to the original transport executor."""
+        if not self._uses_v4_protocol():
             return
-        if any(event.get("object_id") == object_id
-               for event in self.pending_perception_events):
-            return
-        entity = self.object_info.get(object_id) or {}
-        object_type = entity.get("type")
-        event_kind = {
-            0: "new_target_evidence",
-            1: "new_container_evidence",
-            2: "new_bed_evidence",
-        }.get(object_type)
-        if event_kind is None:
-            return
-        position = entity.get("position")
-        serialized_position = None
-        if position is not None:
-            try:
-                serialized_position = [float(value) for value in position[:3]]
-            except (TypeError, ValueError, IndexError):
-                serialized_position = None
-        room = None
-        if position is not None:
-            try:
-                room = self.env_api['belongs_to_which_room'](position)
-            except (KeyError, TypeError, ValueError):
-                room = None
-        self.pending_perception_events.append({
-            "kind": event_kind,
-            "object_id": int(object_id),
-            "name": entity.get("name"),
-            "object_type": object_type,
-            "room": room,
-            "position": serialized_position,
-            "frame": int(self.num_frames or 0),
-        })
-        # Bound prompt growth while retaining substantially more than a single
-        # navigation transition can discover in these scenes.
-        self.pending_perception_events = self.pending_perception_events[-32:]
-
-    def _holding_real_object(self):
-        return any(item.get("type") is not None
-                   for item in self.obs.get("held_objects", []))
-
-    def _prepare_v34_perception_boundary(self):
-        """Open a safe replanning boundary for relevant retained evidence.
-
-        Low-level ``ongoing`` actions are never interrupted.  A newly observed
-        goal target may stop blind room navigation/exploration after its
-        current primitive terminates.  A newly observed bed may do the same
-        while payload is held.  Other events remain queued until the active
-        manipulation task ends naturally.
-        """
-        if not self._uses_v34_protocol() or not self.pending_perception_events:
-            return
-        if self.plan is None:
-            return
-        navigating = self.plan.startswith(("go to ", "explore "))
-        if not navigating:
-            return
-        target_event = any(
-            event.get("kind") == "new_target_evidence" and
-            event.get("name") in self.goal_objects
-            for event in self.pending_perception_events)
-        bed_event = any(
-            event.get("kind") == "new_bed_evidence"
-            for event in self.pending_perception_events)
-        if target_event or (bed_event and self._holding_real_object()):
-            self.plan = None
-
-    def _inject_v34_shared_bed(self):
-        """Expose verified team bed evidence through the legacy bed list.
-
-        The original transport executor intentionally remains byte-for-byte
-        unchanged.  V3.4 reconciles shared symbolic knowledge one layer above
-        it by adapting the compact decision-card fact into the same object
-        record shape produced by local perception.
-        """
-        if not self._uses_shared_delivery_target_adapter():
-            return
-        if self._uses_v35_protocol():
-            self._prune_v35_shared_beds()
+        self._prune_shared_beds()
         if self.object_list[2]:
             return
         shared_bed = self.LLM.shared_delivery_target()
-        source_provenance = ((shared_bed or {}).get("episode_provenance")
-                             if shared_bed else None)
-        if (self._uses_v35_protocol() and
-                source_provenance is not None and
-                source_provenance != self.episode_provenance):
-            # A provenance-bearing record from another episode is never safe
-            # to turn into a navigation target. Records without provenance are
-            # still accepted because current V3.4 cards predate this field.
+        if not shared_bed:
             return
-        shared_position = ((shared_bed or {}).get("position")
-                           if shared_bed else None)
-        if shared_position is None:
+        source_epoch = shared_bed.get("episode_epoch")
+        if source_epoch is not None and source_epoch != getattr(
+                self, "_peer_consult_episode_epoch", None):
             return
         try:
-            position = np.asarray(shared_position[:3], dtype=float)
-        except (TypeError, ValueError, IndexError):
+            position = np.asarray(shared_bed["position"][:3], dtype=float)
+            if position.shape != (3,) or not np.all(np.isfinite(position)):
+                return
+        except (KeyError, TypeError, ValueError, IndexError):
             return
-        room = (shared_bed or {}).get("room")
+        room = shared_bed.get("room")
         if room is None:
-            room = self.env_api['belongs_to_which_room'](position)
+            room = self.env_api["belongs_to_which_room"](position)
         record = {
-            "id": (shared_bed or {}).get("id"),
+            "id": shared_bed.get("id"),
             "type": 2,
-            "name": (shared_bed or {}).get("name") or "bed",
+            "name": shared_bed.get("name") or "bed",
             "position": position,
             "knowledge_source": "shared_memory_board",
+            "episode_provenance": self.episode_provenance,
         }
-        if self._uses_v35_protocol():
-            record["episode_provenance"] = self.episode_provenance
-            record["source_episode_provenance"] = source_provenance
         self.object_list[2].append(record)
         if room in self.object_per_room:
             self.object_per_room[room][2].append(record)
@@ -497,10 +358,6 @@ class lm_agent:
                     (self.fix_lm_satisfied and object_id in self.with_oppo)):
                 continue
             self.object_info[object_id]['position'] = position
-            if new_obj:
-                # Unlike ``new_object_list``, this event isn't lost when two
-                # objects quantize into the same semantic-map cell.
-                self._queue_perception_event(object_id)
             if o_dict['type'] == 0:
                 x, y, z = self.object_info[object_id]['position']
 
@@ -570,7 +427,6 @@ class lm_agent:
         self.object_info = {}
         self.object_list = {0: [], 1: [], 2: []}
         self.new_object_list = {0: [], 1: [], 2: []}
-        self.pending_perception_events = []
         if self._uses_episode_isolation_protocol():
             # These views/cursors were missing from the legacy reset and could
             # therefore point into the preceding dataset episode until the
@@ -586,7 +442,6 @@ class lm_agent:
             # clearing it here makes that ordering an invariant instead of an
             # implicit requirement and also covers direct-agent test paths.
             self.LLM.peer_decision_card = None
-            self.LLM.pending_perception_events = []
             self.LLM.current_room = None
             self.LLM.rooms_explored = None
             self.LLM.object_list = None
@@ -638,21 +493,11 @@ class lm_agent:
         self.save_img = save_img
 
     def _execute_room_navigation_plan(self):
-        """Dispatch room navigation without changing published executors."""
-        if self._uses_v4_protocol():
-            return self.gotoroom()
-        if self._uses_v34_protocol():
-            return self.gotoroom_v34()
-        if self.stable_task_protocol:
-            return self.gotoroom_v33()
+        """Use the original CoELA room navigation skill."""
         return self.gotoroom()
 
     def _execute_room_exploration_plan(self):
-        """Dispatch exploration while keeping V4 on original CoELA logic."""
-        if self._uses_v4_protocol():
-            return self.goexplore()
-        if self.coverage_exploration:
-            return self.goexplore_v33()
+        """Use the original CoELA room exploration skill."""
         return self.goexplore()
 
     def move(self, target_pos):
@@ -677,31 +522,6 @@ class lm_agent:
             return None
         return self.move(target_pos)
 
-    def gotoroom_v33(self):
-        """Stable V3.3 room transition using the unchanged path executor."""
-        target_room = ' '.join(self.plan.split(' ')[2: 4])
-        if target_room[-1] == ',': target_room = target_room[:-1]
-        if self.debug:
-            print(target_room)
-        target_pos = self.env_api['center_of_room'](target_room)
-        if self.current_room == target_room and self.room_distance == 0:
-            self.plan = None
-            return None
-        # New objects are retained as evidence for the next decision boundary;
-        # they no longer erase the current transition mid-route.
-        return self.move(target_pos)
-
-    def gotoroom_v34(self):
-        """V3.4 transition; perception is reviewed at safe boundaries.
-
-        The review happens centrally in ``act`` after a low-level primitive
-        terminates.  Keeping this executor free of object-specific interrupts
-        prevents the original target oscillation while ensuring evidence is
-        neither discarded nor delayed indefinitely.
-        """
-        return self.gotoroom_v33()
-
-
     def goexplore(self):
         target_room = ' '.join(self.plan.split(' ')[-2:])
         # assert target_room == self.current_room, f"{target_room} != {self.current_room}"
@@ -720,51 +540,6 @@ class lm_agent:
         self.rotated += 1
         action = {"type": 1}
         return action
-
-    def goexplore_v33(self):
-        """Visit several room samples while reusing upstream navigation."""
-        target_room = ' '.join(self.plan.split(' ')[-2:])
-        if self.explore_route_room != target_room:
-            waypoint_fn = self.env_api.get('room_waypoints')
-            raw_waypoints = (waypoint_fn(target_room)
-                             if waypoint_fn is not None else
-                             [self.env_api['center_of_room'](target_room)])
-            remaining = [np.asarray(value, dtype=float)
-                         for value in raw_waypoints]
-            ordered = []
-            cursor = np.asarray(self.position, dtype=float)
-            while remaining:
-                index = min(
-                    range(len(remaining)),
-                    key=lambda value: np.linalg.norm(
-                        remaining[value][[0, 2]] - cursor[[0, 2]]))
-                cursor = remaining.pop(index)
-                ordered.append(cursor)
-            self.explore_route_room = target_room
-            self.explore_waypoints = ordered
-            self.explore_waypoint_index = 0
-            self.explore_scan_turns = 0
-
-        if self.explore_waypoint_index >= len(self.explore_waypoints):
-            self.rooms_explored[target_room] = 'all'
-            self.plan = None
-            self.explore_route_room = None
-            return None
-        target_pos = self.explore_waypoints[self.explore_waypoint_index]
-        if not self.reach_target_pos(target_pos, 1.0):
-            return self.move(target_pos)
-        if self.explore_scan_turns < 4:
-            self.explore_scan_turns += 1
-            return {"type": 1}
-        self.explore_waypoint_index += 1
-        self.explore_scan_turns = 0
-        if self.explore_waypoint_index >= len(self.explore_waypoints):
-            self.rooms_explored[target_room] = 'all'
-            self.plan = None
-            self.explore_route_room = None
-            return None
-        return self.move(self.explore_waypoints[
-            self.explore_waypoint_index])
 
     def gograsp(self):
         target_object_id = int(self.plan.split(' ')[-1][1:-1])
@@ -837,21 +612,19 @@ class lm_agent:
         return obj_infos, curr_seg_mask
 
     def LLM_plan(self):
-        # Some legacy/unit construction paths instantiate lm_agent without
-        # running the modern __init__/reset sequence.  V3.4's event queue is
-        # optional state for those paths, so treat an absent queue as empty.
-        pending_events = copy.deepcopy(
-            getattr(self, "pending_perception_events", []))
-        self.LLM.pending_perception_events = pending_events
-        result = self.LLM.run(self.num_frames, self.current_room, self.rooms_explored, self.obs['held_objects'],[self.object_info[x] for x in self.satisfied if x in self.object_info], self.object_list, self.object_per_room, self.action_history, self.dialogue_history, self.obs['oppo_held_objects'], self.oppo_last_room)
-        # Consume only after the model call returned successfully; transport
-        # or infrastructure exceptions therefore cannot silently lose events.
-        processed_ids = {event.get("object_id") for event in pending_events}
-        self.pending_perception_events = [
-            event for event in getattr(
-                self, "pending_perception_events", [])
-            if event.get("object_id") not in processed_ids]
-        return result
+        return self.LLM.run(
+            self.num_frames,
+            self.current_room,
+            self.rooms_explored,
+            self.obs["held_objects"],
+            [self.object_info[x] for x in self.satisfied if x in self.object_info],
+            self.object_list,
+            self.object_per_room,
+            self.action_history,
+            self.dialogue_history,
+            self.obs["oppo_held_objects"],
+            self.oppo_last_room,
+        )
 
     def act(self, obs):
         # The V4 Harness monitors *planner* retries, not the low-level motion
@@ -988,14 +761,11 @@ class lm_agent:
         self.get_new_object_list()
         print(self.new_object_list)
         self.get_object_list()
-        self._inject_v34_shared_bed()
-        self._prepare_v34_perception_boundary()
+        self._inject_shared_bed()
 
         info = {'satisfied': self.satisfied,
                 'object_list': self.object_list,
                 'new_object_list': self.new_object_list,
-                'pending_perception_events': copy.deepcopy(
-                    self.pending_perception_events),
                 'current_room': self.current_room,
                 'visible_objects': self.filtered(self.obs['visible_objects']),
                 'obs': {k: v for k, v in self.obs.items() if k not in ['rgb', 'depth', 'seg_mask', 'camera_matrix', 'visible_objects']},

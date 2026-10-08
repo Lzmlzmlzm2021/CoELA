@@ -282,8 +282,7 @@ class LLM:
             self.generator_prompt_template = None
 
         self.communication = communication
-        # PeerConsult V3.1 can close only the outbound message slot while
-        # retaining the communication prompt and received dialogue context.
+        # The V4 coordinator may temporarily close the outbound message slot.
         self.allow_message_this_turn = True
         # Disabled by default for exact upstream-baseline behavior.
         self.fix_lm_communication = _env_flag_enabled(
@@ -757,53 +756,12 @@ class LLM:
         agent_role = getattr(self, "agent_role", "human")
         available_plans = []
         if self.communication and include_message:
-            # V3.3 asks the planner whether communication is worth an action
-            # before spending a separate model call on wording it.
             available_plans.append("send a message")
         elif self.communication and message is not None:
-            # Preserve the legacy API used by older protocols and tests.
             available_plans.append(f"send a message: {message}")
         task_card = getattr(self, "peer_decision_card", None)
-        task_rows = ((task_card or {}).get("task_queue") or [])
         is_v4 = (getattr(self, "peer_consult_protocol", None) ==
                  "PeerConsultV4")
-        # A target whose lifecycle has already advanced beyond acquisition
-        # must never re-enter the grasp menu.  In particular, ``carried``
-        # objects are still present in the V3.3 task queue and can remain in a
-        # stale private object map; admitting them here caused the repeated
-        # cannot_grasp loops seen in E14.
-        non_acquirable_statuses = {
-            "blocked", "carried", "completed", "surplus", "delivered",
-            "in_use",
-        }
-        payload_ids = set()
-        for owner_key in ("self", "peer"):
-            for item in (((task_card or {}).get(owner_key) or {})
-                         .get("payload") or []):
-                if item.get("id") is not None:
-                    payload_ids.add(int(item["id"]))
-        allowed_target_ids = {
-            int(row["object_id"]) for row in task_rows
-            if (row.get("kind") == "deliver_goal_object" and
-                str(row.get("status") or "").lower() not in
-                non_acquirable_statuses and
-                row.get("object_id") is not None and
-                int(row["object_id"]) not in payload_ids)
-        }
-        allowed_container_ids = {
-            int(item["id"]) for item in
-            ((task_card or {}).get("actionable_containers") or [])
-            if item.get("id") is not None
-        }
-        # V3.x's card is a shared-board whitelist.  V4 deliberately keeps
-        # unpublished local perception private, so absence from the shared
-        # task queue cannot make a locally observed, physically available
-        # object disappear from this agent's candidate set.  Atomic claim and
-        # physical-truth validation happen after proposal collection.
-        local_goal_work = bool(task_card and any(
-            int(obj["id"]) in allowed_target_ids
-            for obj in self.object_list[0]
-            if obj.get("id") is not None))
         holding_payload = any(
             obj.get('type') is not None for obj in self.holding_objects)
         local_bed_known = bool(self.object_list[2])
@@ -821,15 +779,9 @@ class LLM:
         if agent_role != "scout":
             if self.holding_objects[0]['type'] is None or self.holding_objects[1]['type'] is None:
                 for obj in self.object_list[0]:
-                    if (task_card and not is_v4 and
-                            int(obj['id']) not in allowed_target_ids):
-                        continue
                     available_plans.append(f"go grasp target object <{obj['name']}> ({obj['id']})")
                 if not (self.holding_objects[0]['type'] == 1 or self.holding_objects[1]['type'] == 1):
                     for obj in self.object_list[1]:
-                        if (task_card and not is_v4 and
-                                int(obj['id']) not in allowed_container_ids):
-                            continue
                         available_plans.append(f"go grasp container <{obj['name']}> ({obj['id']})")
             else:
                 if self.holding_objects[0]['type'] == 1 and self.holding_objects[0]['contained'][-1] is None and self.holding_objects[1]['type'] == 0:
@@ -839,46 +791,30 @@ class LLM:
             if (holding_payload and
                     (local_bed_known or shared_bed_navigable)):
                 available_plans.append(f"transport objects I'm holding to the bed")
-        # V3.3-V3.5 intentionally suppress blind room search once useful local
-        # goal work is known.  PeerConsult V4 restores upstream CoELA's
-        # candidate completeness: a legal exploration action remains visible
-        # even when a local target is also available.  This is protocol-gated
-        # so archived V3.x runs and ablations retain their exact action space.
-        #
-        # The LLM, rather than this compiler, decides whether the information
-        # value of exploration is worth giving up target-task continuity.
-        # No distance, confidence, container-utility, or waypoint policy is
-        # introduced here.
-        # Liveness invariant: a full carrier that hasn't personally observed
-        # the bed must still be able to act.  A team-shared bed position enables
-        # transport directly; otherwise room navigation/exploration remains
-        # available even while a known goal task exists.  This avoids the
-        # ``known goal -> suppress search`` + ``unknown local bed -> suppress
-        # transport`` empty-action intersection.
+        # A carrier without a known bed can still search for the goal location.
         locating_bed = bool(
             agent_role != "scout" and holding_payload and
             not local_bed_known and not shared_bed_navigable)
-        if is_v4 or not local_goal_work or locating_bed:
-            rooms = list(self.rooms)
-            if shared_bed_room in rooms:
-                rooms.remove(shared_bed_room)
-                rooms.insert(0, shared_bed_room)
-            for room in rooms:
-                if room == self.current_room or room is None or room == 'None':
-                    continue
-                available_plans.append(f"go to {room}")
-            if (self.current_room not in self.rooms_explored or
-                    self.rooms_explored[self.current_room] != 'all' or
-                    (locating_bed and shared_bed_room == self.current_room)):
-                available_plans.append(f"explore current room {self.current_room}")
-            # Even a one-room scene marked fully explored must not collapse to
-            # an empty plan while a payload is stranded without a delivery
-            # position. Re-scan is preferable to thousands of forced waits.
-            if (locating_bed and not any(
-                    not plan.startswith("send a message")
-                    for plan in available_plans)):
-                available_plans.append(
-                    f"explore current room {self.current_room}")
+        rooms = list(self.rooms)
+        if shared_bed_room in rooms:
+            rooms.remove(shared_bed_room)
+            rooms.insert(0, shared_bed_room)
+        for room in rooms:
+            if room == self.current_room or room is None or room == 'None':
+                continue
+            available_plans.append(f"go to {room}")
+        if (self.current_room not in self.rooms_explored or
+                self.rooms_explored[self.current_room] != 'all' or
+                (locating_bed and shared_bed_room == self.current_room)):
+            available_plans.append(f"explore current room {self.current_room}")
+        # Even a one-room scene marked fully explored must not collapse to
+        # an empty plan while a payload is stranded without a delivery
+        # position. Re-scan is preferable to thousands of forced waits.
+        if (locating_bed and not any(
+                not plan.startswith("send a message")
+                for plan in available_plans)):
+            available_plans.append(
+                f"explore current room {self.current_room}")
         if agent_role == "scout":
             available_plans.append("wait")
 
@@ -982,35 +918,10 @@ class LLM:
         return communication + preferred + remainder
 
     def shared_delivery_target(self):
-        """Return a compact team-shared bed record when the card provides it.
-
-        V3.4 publishes ``shared_bed``.  The aliases keep this planner tolerant
-        of diagnostic cards and make no change to V3.3/legacy runs, whose
-        cards don't contain any of these keys.
-        """
+        """Return the V4 team's shared bed target, if one is known."""
         card = getattr(self, "peer_decision_card", None) or {}
-        advisory = card.get("delivery_advisory") or {}
-        for source in (card, advisory):
-            for key in ("shared_bed", "delivery_target", "known_bed",
-                        "bed"):
-                value = source.get(key)
-                if isinstance(value, list):
-                    value = value[0] if value else None
-                if isinstance(value, dict):
-                    return value
-        # V3.4's delivery advisory also exposes compact flat fields so the
-        # coordinator needn't duplicate the bed entity in the card.
-        if advisory.get("bed_position") is not None:
-            return {
-                "id": advisory.get("bed_object_id"),
-                "name": "bed",
-                "type": 2,
-                "position": advisory.get("bed_position"),
-                "room": advisory.get("bed_room"),
-                "knowledge_source": advisory.get(
-                    "bed_knowledge_source"),
-            }
-        return None
+        target = card.get("delivery_target")
+        return target if isinstance(target, dict) else None
 
 
     def run(self, current_step, current_room, rooms_explored, holding_objects, satisfied, object_list, obj_per_room, action_history, dialogue_history, opponent_grabbed_objects = None, opponent_last_room = None):
@@ -1047,22 +958,9 @@ class LLM:
             prompt = prompt.replace('$DIALOGUE_HISTORY$', '')
 
         protocol = getattr(self, "peer_consult_protocol", None)
-        is_v33 = protocol in (
-            "PeerConsultV3.3", "PeerConsultV3.4", "PeerConsultV3.5")
-        is_v34 = protocol in ("PeerConsultV3.4", "PeerConsultV3.5")
         is_v4 = protocol == "PeerConsultV4"
-        decision_first_communication = is_v33 or is_v4
-        if is_v33:
-            prompt += (
-                f"\n{protocol} decision policy: continue or resume an "
-                "unfinished goal-object task before blind exploration. "
-                "Do not switch merely because new evidence appeared; switch "
-                "only after completion, a physical impossibility, a conflict, "
-                "or a blocking review. A communication slot is optional: "
-                "choose 'send a message' only when the listed new event would "
-                "change the peer's next action, and never repeat a fact."
-            )
-        elif is_v4:
+        decision_first_communication = is_v4
+        if is_v4:
             prompt += (
                 "\nPeerConsultV4 decision policy: every listed action is a "
                 "legal option. The active task is a continuity hint, not a "
@@ -1075,25 +973,11 @@ class LLM:
                 "a concise task, claim, failure, or release update that can "
                 "change the peer's next action."
             )
-        pending_events = list(
-            getattr(self, "pending_perception_events", None) or [])
-        if is_v34 and pending_events:
-            prompt += (
-                "\nNew perception events retained until this safe planning "
-                "boundary: " + json.dumps(
-                    pending_events, ensure_ascii=False,
-                    separators=(",", ":")) +
-                ". These are evidence, not mandatory task switches. Prefer "
-                "a newly visible undelivered goal target over blind search; "
-                "if a bed became known while carrying payload, consider "
-                "delivery. Otherwise resume the persistent active task."
-            )
         legacy_message = None
         if (self.communication and not decision_first_communication and
                 self.allow_message_this_turn and
                 not action_history[-1].startswith('send a message')):
-            # Preserve the published/V3.x ablation behavior. Only V3.3 moves
-            # content generation behind the planner's send decision.
+            # Original CoELA generates message text before action selection.
             gen_prompt = self.generator_prompt_template.replace(
                 '$GOAL$', self.goal_desc)
             gen_prompt = gen_prompt.replace('$PROGRESS$', progress_desc)
@@ -1184,18 +1068,7 @@ class LLM:
             gen_prompt = gen_prompt.replace(
                 '$DIALOGUE_HISTORY$', dialogue_history_desc)
             v4_event_ids = []
-            if is_v33:
-                events = ((getattr(self, "peer_decision_card", None) or {})
-                          .get("delivery_advisory", {})
-                          .get("communication_events", []))
-                gen_prompt += (
-                    "\nWrite one concise, non-redundant coordination sentence "
-                    "about this newly opened event only: " +
-                    (", ".join(events) if events else "none") +
-                    ". Do not restate your destination, room search, or "
-                    "container intent if the peer already knows it."
-                )
-            elif is_v4:
+            if is_v4:
                 events = ((getattr(self, "peer_decision_card", None) or {})
                           .get("coordination_events", []))
                 allowed_event_types = {
